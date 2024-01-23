@@ -6,15 +6,19 @@ import json
 from base64 import encode
 from opensearchpy import OpenSearch, RequestsHttpConnection, AWSV4SignerAuth
 
-pi_client = boto3.client('pi')
-rds_client = boto3.client('rds')
-cw_client = boto3.client('cloudwatch')
+region = 'ap-northeast-2'
+
+pi_client = boto3.client('pi', region)
+rds_client = boto3.client('rds', region)
+cw_client = boto3.client('cloudwatch', region)
 
 host = 'vpc-test-aponilxfo5qn2nfe6mitxf2rxu.ap-northeast-2.es.amazonaws.com' # cluster endpoint, for example: my-test-domain.us-east-1.es.amazonaws.com
-region = 'ap-northeast-2'
 service = 'es'
 credentials = boto3.Session().get_credentials()
 auth = AWSV4SignerAuth(credentials, region, service)
+
+interval = 600
+period = 60
 
 es_client = OpenSearch(
     hosts = [{'host': host, 'port': 443}],
@@ -25,7 +29,6 @@ es_client = OpenSearch(
     pool_maxsize = 20
 )
 
-
 def get_pi_instances():
     response = rds_client.describe_db_instances()
     
@@ -33,7 +36,7 @@ def get_pi_instances():
     
     for instance in response['DBInstances']:
         for tag in instance.get('TagList', []):
-            if tag.get('Key') == 'monitor' and tag.get('Value') == 'true':
+            if tag.get('Key') == 'monitor_test' and tag.get('Value') == 'true':
                 target_instance.append(instance)
                 break
     # pprint.pprint(target_instance)
@@ -49,9 +52,9 @@ def get_resource_metrics(instance, query):
                 'pi_response': pi_client.get_resource_metrics(
                              ServiceType='RDS',
                              Identifier=instance['DbiResourceId'],
-                             StartTime=time.time() - 60,
+                             StartTime=time.time() - interval,
                              EndTime=time.time(),
-                             PeriodInSeconds=60,
+                             PeriodInSeconds=period,
                              MetricQueries=query
                              ), 
                 'dbinstanceidentifier': instance['DBInstanceIdentifier']
@@ -69,7 +72,7 @@ def send_cloudwatch_data(get_info):
     
     metric_data = []
     
-    pprint.pprint(get_info['pi_response']['MetricList'])
+    # pprint.pprint(get_info['pi_response']['MetricList'])
     for metric_response in get_info['pi_response']['MetricList']: #dataoints and key
         metric_dict = metric_response['Key']  #db.load.avg
         metric_name = metric_dict['Metric']
@@ -83,11 +86,38 @@ def send_cloudwatch_data(get_info):
             for key in metric_dimensions:
                 metric_name = key.split(".")[1]
                 formatted_dims.append(dict(Name=key, Value=str_encode(metric_dimensions[key])))
-                
-                # if key == "db.sql_tokenized.statement":
-                #     formatted_dims.append(dict(Name=key, Value=str_encode(metric_dimensions[key])))
-                # else:
-                #     formatted_dims.append(dict(Name=key, Value=str_encode(metric_dimensions[key]))) 
+
+                if key == 'db.sql_tokenized.id' :
+                    db_sql_tokenized_id = metric_dimensions[key]
+                    db_resource_id = get_info['pi_response']['Identifier']
+
+                    query_metric_response =  pi_client.describe_dimension_keys(
+                                                ServiceType='RDS',
+                                                Identifier=db_resource_id,
+                                                StartTime=time.time() - interval,
+                                                EndTime=time.time(),
+                                                Metric="db.load.avg",
+                                                PeriodInSeconds=period,
+                                                GroupBy={
+                                                    'Group': 'db.sql_tokenized'
+                                                },
+                                                Filter={
+                                                    'db.sql_tokenized.id': 	db_sql_tokenized_id
+                                                },
+                                                AdditionalMetrics=['db.sql_tokenized.stats.sum_rows_examined_per_call.avg', # 호출당 검사된 행
+                                                                'db.sql_tokenized.stats.sum_rows_affected_per_call.avg', # 호출당 영향을 받는 행
+                                                                'db.sql_tokenized.stats.sum_timer_wait_per_call.avg', # 호출당 평균 지연 시간(단위: ms)
+                                                                'db.sql_tokenized.stats.count_star_per_sec.avg'] # 초당 호출 수
+                                            )
+                    # pprint.pprint(query_metric_response)
+                    query_metric_dimensions_list = query_metric_response['Keys']
+                    for query_metric_dimensions in query_metric_dimensions_list :                        
+                        if 'AdditionalMetrics' in query_metric_dimensions :
+                            for key in query_metric_dimensions['AdditionalMetrics'] :
+                                # db.sql_tokenized.stats.count_star_per_sec.avg
+                                # type: <class 'float'>, valid types: <class 'str'>
+                                formatted_dims.append({'Name': key, 'Value': str(query_metric_dimensions['AdditionalMetrics'][key])})
+               
 
             formatted_dims.append(dict(Name='DBInstanceIdentifier', Value=get_info['dbinstanceidentifier']))
             is_metric_dimensions = True
@@ -134,7 +164,9 @@ def send_cloudwatch_data(get_info):
 def send_opensearch_data(get_info):
     metric_data = []
     
-    pprint.pprint(get_info['pi_response']['MetricList'])
+    # pprint.pprint(get_info['pi_response'])
+    
+    # pprint.pprint(get_info['pi_response']['MetricList'])
     for metric_response in get_info['pi_response']['MetricList']:
         metric_dict = metric_response['Key']
         metric_name = metric_dict['Metric']
@@ -148,9 +180,40 @@ def send_opensearch_data(get_info):
                 metric_name = key.split(".")[1]
                 formatted_dims.append({'Name': key, 'Value': str_encode(metric_dimensions[key])})
 
+                if key == 'db.sql_tokenized.id' :
+                    db_sql_tokenized_id = metric_dimensions[key]
+                    db_resource_id = get_info['pi_response']['Identifier']
+
+                    query_metric_response =  pi_client.describe_dimension_keys(
+                                                ServiceType='RDS',
+                                                Identifier=db_resource_id,
+                                                StartTime=time.time() - interval,
+                                                EndTime=time.time(),
+                                                Metric="db.load.avg",
+                                                PeriodInSeconds=period,
+                                                GroupBy={
+                                                    'Group': 'db.sql_tokenized'
+                                                },
+                                                Filter={
+                                                    'db.sql_tokenized.id': 	db_sql_tokenized_id
+                                                },
+                                                AdditionalMetrics=['db.sql_tokenized.stats.sum_rows_examined_per_call.avg', # 호출당 검사된 행
+                                                                'db.sql_tokenized.stats.sum_rows_affected_per_call.avg', # 호출당 영향을 받는 행
+                                                                'db.sql_tokenized.stats.sum_timer_wait_per_call.avg', # 호출당 평균 지연 시간(단위: ms)
+                                                                'db.sql_tokenized.stats.count_star_per_sec.avg'] # 초당 호출 수
+                                            )
+                    pprint.pprint(query_metric_response)
+                    query_metric_dimensions_list = query_metric_response['Keys']
+                    for query_metric_dimensions in query_metric_dimensions_list :
+                        if 'AdditionalMetrics' in query_metric_dimensions :
+                            for key in query_metric_dimensions['AdditionalMetrics'] :
+                                # db.sql_tokenized.stats.count_star_per_sec.avg
+                                formatted_dims.append({'Name': key, 'Value': query_metric_dimensions['AdditionalMetrics'][key]})
+
             formatted_dims.append({'Name': 'DBInstanceIdentifier', 'Value': get_info['dbinstanceidentifier']})
             is_metric_dimensions = True
 
+        # pprint.pprint(formatted_dims)
         for datapoint in metric_response['DataPoints']:
             value = datapoint.get('Value', None)
             if value:
@@ -175,62 +238,28 @@ def send_opensearch_data(get_info):
                     }) 
     
     if metric_data:
-        # try:
-        for metric in metric_data:
-            document = {
-                'timestamp': metric['Timestamp'].isoformat(),
-                'metric_name': metric['MetricName'],
-                'value': metric['Value']
-            }
-            if metric['Dimensions']:
-                for dim in metric['Dimensions']:
-                    document[dim['Name']] = dim['Value']
-            
-            es_client.index(
-                index='test_pi_metric',
-                body=document
-            )
-        # except Exception as error:
-        #     raise ValueError('Failed to send data to OpenSearch: {}'.format(error))
+        try:
+            for metric in metric_data:
+                document = {
+                    'timestamp': metric['Timestamp'].isoformat(),
+                    'metric_name': metric['MetricName'],
+                    'value': metric['Value']
+                }
+                if metric['Dimensions']:
+                    for dim in metric['Dimensions']:
+                        document[dim['Name']] = dim['Value']
+                
+                es_client.index(
+                    index='test_pi_metric',
+                    body=document
+                )
+        except Exception as error:
+            raise ValueError('Failed to send data to OpenSearch: {}'.format(error))
     else:
         pass
 
-# def send_cloudwatch_data(get_info):
-#     metric_data = []
 
-#     # print(get_info['dbinstanceidentifier'])
-
-#     # pprint.pprint(get_info['pi_response'])
-
-#     pprint.pprint(get_info['pi_response'])
-#     for metric_response in get_info['pi_response']['MetricList']:
-#         # pprint.pprint(pi_response)
-#         cur_key = metric_response['Key']['Metric']
-
-#         for datapoint in metric_response['DataPoints']:
-#             # We don't always have values from an instance
-#             value = datapoint.get('Value', None)
-
-#             if value:
-#                 metric_data.append({
-#                     'MetricName': cur_key,
-#                     'Dimensions': [
-#                         {
-#                             'Name':'DBInstanceIdentifier',    
-#                             'Value':get_info['dbinstanceidentifier']
-#                         } 
-#                     ],
-#                     'Timestamp': datapoint['Timestamp'],
-#                     'Value': datapoint['Value']
-#                 })
-
-#     if metric_data:
-#         # pprint.pprint(metric_data)
-#         cw_client.put_metric_data(
-#             Namespace='PI-TEST',
-#             MetricData= metric_data
-#         )
-
+##################
 
 
 pi_instances = get_pi_instances()
@@ -256,9 +285,11 @@ for query in querys :
     for instance in pi_instances:
             get_info = get_resource_metrics(instance, query)
             if get_info['pi_response']:
-                # send_cloudwatch_data(get_info)
+                print("#### CloudWatch Start!")
+                send_cloudwatch_data(get_info)
+                print("#### OpenSearch Start!")
                 send_opensearch_data(get_info)
             
-    print("# Put Data to CW : ", datetime.datetime.now())
+    # print("# Put Data to CW : ", datetime.datetime.now())
 
 
