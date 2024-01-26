@@ -39,6 +39,9 @@
         "Metric": "db.Locks.innodb_deadlocks.avg"
     },
     {
+        "Metric": "db.Locks.Innodb_row_lock_time.avg"
+    },
+    {
         "Metric": "db.Cache.innoDB_buffer_pool_hits.avg"
     },
     {
@@ -46,9 +49,6 @@
     },
     {
         "Metric": "db.Cache.innoDB_buffer_pool_hit_rate.avg"
-    },
-    {
-        "Metric": "db.Locks.Innodb_row_lock_time.avg"
     },
     {
         "Metric": "os.cpuUtilization.steal.avg"

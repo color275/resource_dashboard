@@ -5,6 +5,8 @@ import pprint
 import json
 from base64 import encode
 from opensearchpy import OpenSearch, RequestsHttpConnection, AWSV4SignerAuth
+import textwrap
+import os
 
 region = 'ap-northeast-2'
 
@@ -36,7 +38,7 @@ def get_pi_instances():
     
     for instance in response['DBInstances']:
         for tag in instance.get('TagList', []):
-            if tag.get('Key') == 'monitor_test' and tag.get('Value') == 'true':
+            if tag.get('Key') == 'monitor' and tag.get('Value') == 'true':
                 target_instance.append(instance)
                 break
     # pprint.pprint(target_instance)
@@ -86,6 +88,10 @@ def send_cloudwatch_data(get_info):
             for key in metric_dimensions:
                 metric_name = key.split(".")[1]
                 formatted_dims.append(dict(Name=key, Value=str_encode(metric_dimensions[key])))
+
+                if key == 'db.sql_tokenized.statement' :
+                    db_sql_short_statement = textwrap.shorten(metric_dimensions[key], width=150, placeholder='...')
+                    formatted_dims.append({'Name': 'db.sql_short.statement', 'Value': str_encode(db_sql_short_statement)})
 
                 if key == 'db.sql_tokenized.id' :
                     db_sql_tokenized_id = metric_dimensions[key]
@@ -161,7 +167,50 @@ def send_cloudwatch_data(get_info):
         # logger.info('## NO Metric Data ##')
         pass
 
-def send_opensearch_data(get_info):
+def send_opensearch_single_metric_data(get_info):
+    formatted_dims = {} 
+
+    for metric_response in get_info['pi_response']['MetricList']:
+
+        metric_dict = metric_response['Key']
+        metric_name2 = metric_dict['Metric']          
+        
+        metric_name1 = ""
+        parts = metric_name2.split(".")
+        if len(parts) >= 2:
+            metric_name1 = parts[0] + "." + parts[1]
+        else :
+            metric_name1 = metric_name2
+
+        for datapoint in metric_response['DataPoints']:
+            timestamp = datapoint['Timestamp']
+            if 'Value' in datapoint :
+                value = datapoint['Value']
+                dim = {'Name': metric_name2, 'Value': value}
+
+                if timestamp in formatted_dims :
+                    formatted_dims[timestamp].append(dim)
+                else :
+                    formatted_dims[timestamp] = [dim,]
+    
+    document = {}
+    for k, v in formatted_dims.items() :
+        document = {
+                    'timestamp': k.isoformat(),
+                    'metric_name': metric_name1                    
+                }
+        for m in v :
+            document[m['Name']] = m['Value']
+        
+        document['DBInstanceIdentifier'] = get_info['dbinstanceidentifier']
+        
+        es_client.index(
+                    index='test_pi_metric3',
+                    body=document
+                )
+
+
+def send_opensearch_group_metric_data(get_info):
     metric_data = []
     
     # pprint.pprint(get_info['pi_response'])
@@ -178,11 +227,15 @@ def send_opensearch_data(get_info):
             
             for key in metric_dimensions:
                 metric_name = key.split(".")[1]
-                formatted_dims.append({'Name': key, 'Value': str_encode(metric_dimensions[key])})
-
+                formatted_dims.append({'Name': key, 'Value': str_encode(metric_dimensions[key])})                
+                
+                if key == 'db.sql_tokenized.statement' :
+                    db_sql_short_statement = textwrap.shorten(metric_dimensions[key], width=150, placeholder='...')
+                    formatted_dims.append({'Name': 'db.sql_short.statement', 'Value': str_encode(db_sql_short_statement)})
+                
                 if key == 'db.sql_tokenized.id' :
                     db_sql_tokenized_id = metric_dimensions[key]
-                    db_resource_id = get_info['pi_response']['Identifier']
+                    db_resource_id = get_info['pi_response']['Identifier']                    
 
                     query_metric_response =  pi_client.describe_dimension_keys(
                                                 ServiceType='RDS',
@@ -202,7 +255,7 @@ def send_opensearch_data(get_info):
                                                                 'db.sql_tokenized.stats.sum_timer_wait_per_call.avg', # 호출당 평균 지연 시간(단위: ms)
                                                                 'db.sql_tokenized.stats.count_star_per_sec.avg'] # 초당 호출 수
                                             )
-                    pprint.pprint(query_metric_response)
+                    # pprint.pprint(query_metric_response)
                     query_metric_dimensions_list = query_metric_response['Keys']
                     for query_metric_dimensions in query_metric_dimensions_list :
                         if 'AdditionalMetrics' in query_metric_dimensions :
@@ -250,7 +303,7 @@ def send_opensearch_data(get_info):
                         document[dim['Name']] = dim['Value']
                 
                 es_client.index(
-                    index='test_pi_metric',
+                    index='test_pi_metric3',
                     body=document
                 )
         except Exception as error:
@@ -264,32 +317,53 @@ def send_opensearch_data(get_info):
 
 pi_instances = get_pi_instances()
 
-file_path = "./query.json"
-with open(file_path, 'r') as file:
-    metric_queries = json.load(file)
+directory_path = "./metric"
 
-print(len(metric_queries))
+
+for filename in os.listdir(directory_path):
+    if filename.endswith(".json"):
+        file_path = os.path.join(directory_path, filename)
+        
+        with open(file_path, 'r') as file:
+            metric_queries = json.load(file)
+
+        for instance in pi_instances:
+            get_info = get_resource_metrics(instance, metric_queries)
+
+            # pprint.pprint(get_info)
+            if get_info['pi_response']:
+                if filename == "db.load.json" :
+                    send_opensearch_group_metric_data(get_info)
+                else :
+                    send_opensearch_single_metric_data(get_info)
+        
+        print(f"Processing {filename}: {len(metric_queries)} metrics Complete!")
+
+
 
 # 구성원 배열: 최소 항목 수: 1개. 최대 15개 항목.
 # https://docs.aws.amazon.com/ko_kr/performance-insights/latest/APIReference/API_GetResourceMetrics.html#API_GetResourceMetrics_RequestSyntax
-limit_query_num = 15
+# limit_query_num = 15
 
-querys = []
+# querys = []
 
-for i in range(0, len(metric_queries), limit_query_num):
-    query = metric_queries[i:i+limit_query_num]
-    querys.append(query)
+# for i in range(0, len(metric_queries), limit_query_num):
+#     query = metric_queries[i:i+limit_query_num]
+#     querys.append(query)
 
-for query in querys :
+# for query in querys :
 
-    for instance in pi_instances:
-            get_info = get_resource_metrics(instance, query)
-            if get_info['pi_response']:
-                print("#### CloudWatch Start!")
-                send_cloudwatch_data(get_info)
-                print("#### OpenSearch Start!")
-                send_opensearch_data(get_info)
+#     for instance in pi_instances:
+#             get_info = get_resource_metrics(instance, query)
+
+#             # pprint.pprint(get_info)
+#             if get_info['pi_response']:
+#                 # print("#### CloudWatch Start!")
+#                 # send_cloudwatch_data(get_info)
+#                 print("#### OpenSearch Start!")
+#                 # send_opensearch_data(get_info)
+#                 send_opensearch_single_metric_data(get_info)
             
-    # print("# Put Data to CW : ", datetime.datetime.now())
+#     # print("# Put Data to CW : ", datetime.datetime.now())
 
 
